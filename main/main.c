@@ -11,6 +11,7 @@
 #include "freertos/task.h"
 #include "tusb.h"
 #include "msc.h"
+#include "wireless.h"
 #include "serial_handler.h"
 #include "serial_bridge.h"
 #include "rom/gpio.h"
@@ -293,6 +294,10 @@ void app_main(void)
 
     tusb_init();
     msc_init();
+
+    // Wireless serial (RFC2217 over WiFi). Mounts LittleFS, ensures WIFI.TXT, and
+    // starts the BOOT-button double-click watcher. Radio stays off until armed.
+    wireless_init();
 
     xTaskCreate(tusb_device_task, "tusb_device_task", 4 * 1024, NULL, 5, NULL);
 }
