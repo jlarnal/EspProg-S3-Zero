@@ -208,6 +208,29 @@ bool serial_handler_is_flashing(void);
  */
 void serial_handler_set_boot_reset_pins(bool boot_pin, bool reset_pin);
 
+// --- UART ownership lock -----------------------------------------------------
+// Exactly one transport drives the target UART at a time. USB-CDC has priority
+// (it marks itself active on each RX); the network (RFC2217) transport can only
+// acquire when the UART is free, not flashing, and USB has been idle. RX bytes
+// from the target are routed to the current owner (net sink if NET owns, else
+// the registered data callback).
+typedef enum { SERIAL_OWNER_NONE = 0, SERIAL_OWNER_USB, SERIAL_OWNER_NET } serial_owner_t;
+
+/** @brief Try to take the UART lock for 'who'. @return true if now the owner. */
+bool serial_handler_acquire(serial_owner_t who);
+
+/** @brief Release the lock if 'who' currently holds it (else no-op). */
+void serial_handler_release(serial_owner_t who);
+
+/** @brief Current UART owner. */
+serial_owner_t serial_handler_owner(void);
+
+/** @brief Mark USB-CDC activity; refreshes USB's priority window. */
+void serial_handler_mark_usb_activity(void);
+
+/** @brief Register the sink for target->network RX (used while NET owns). */
+void serial_handler_register_net_data_callback(transport_data_received_cb_t cb);
+
 #ifdef __cplusplus
 }
 #endif

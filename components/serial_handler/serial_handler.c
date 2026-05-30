@@ -63,6 +63,51 @@ typedef struct {
 
 static transport_state_t s_transport = {0};
 
+// --- UART ownership lock: exactly one of USB-CDC / network drives the target ---
+static volatile serial_owner_t s_owner = SERIAL_OWNER_NONE;
+static volatile int64_t s_usb_active_until_us = 0;
+#define USB_ACTIVE_WINDOW_US (1500 * 1000)   // USB keeps priority 1.5s after each CDC RX
+static transport_data_received_cb_t s_net_cb = NULL;
+
+void serial_handler_mark_usb_activity(void)
+{
+    s_usb_active_until_us = esp_timer_get_time() + USB_ACTIVE_WINDOW_US;
+    if (s_owner == SERIAL_OWNER_NONE) {
+        s_owner = SERIAL_OWNER_USB;
+    }
+}
+
+serial_owner_t serial_handler_owner(void)
+{
+    return s_owner;
+}
+
+bool serial_handler_acquire(serial_owner_t who)
+{
+    if (who == SERIAL_OWNER_NET) {
+        const bool usb_busy = esp_timer_get_time() < s_usb_active_until_us;
+        if (serial_handler_is_flashing() || usb_busy || s_owner == SERIAL_OWNER_USB) {
+            return false;
+        }
+        s_owner = SERIAL_OWNER_NET;
+        return true;
+    }
+    s_owner = SERIAL_OWNER_USB;
+    return true;
+}
+
+void serial_handler_release(serial_owner_t who)
+{
+    if (s_owner == who) {
+        s_owner = SERIAL_OWNER_NONE;
+    }
+}
+
+void serial_handler_register_net_data_callback(transport_data_received_cb_t cb)
+{
+    s_net_cb = cb;
+}
+
 #if CONFIG_SERIAL_HANDLER_TXD_RELEASE_WHEN_IDLE
 // --- TxD pad ownership -------------------------------------------------------
 // TxD is push-pull only while a programming/monitor session is active; when idle
@@ -193,14 +238,20 @@ static void uart_event_task(void *pvParameters)
             switch (event.type) {
             case UART_DATA:
                 // Only call callback if not flashing and callback is registered
-                if (!atomic_load(&s_transport.is_flashing) && s_transport.data_callback) {
+                if (!atomic_load(&s_transport.is_flashing) && (s_transport.data_callback || s_net_cb)) {
                     size_t buffered_len;
                     uart_get_buffered_data_len(SLAVE_UART_NUM, &buffered_len);
                     const int read = uart_read_bytes(SLAVE_UART_NUM, dtmp, MIN(buffered_len, SLAVE_UART_BUF_SIZE), portMAX_DELAY);
                     ESP_LOGD(TAG, "UART -> Bridge Callback (%d bytes)", read);
                     ESP_LOG_BUFFER_HEXDUMP("UART RX", dtmp, read, ESP_LOG_DEBUG);
 
-                    s_transport.data_callback(dtmp, read);
+                    // Route to the current UART owner: network sink if NET holds the
+                    // lock, otherwise the registered (USB-CDC) data callback.
+                    if (s_owner == SERIAL_OWNER_NET && s_net_cb) {
+                        s_net_cb(dtmp, read);
+                    } else if (s_transport.data_callback) {
+                        s_transport.data_callback(dtmp, read);
+                    }
                 }
                 // Note: When flashing, ESP loader will read data directly from UART
                 break;

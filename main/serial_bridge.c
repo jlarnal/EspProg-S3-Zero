@@ -114,8 +114,13 @@ void tud_cdc_rx_cb(const uint8_t itf)
         ESP_LOGD(TAG, "USB CDC -> Transport (%" PRIu32 " bytes)", rx_size);
         ESP_LOG_BUFFER_HEXDUMP("USB CDC -> Transport", buf, rx_size, ESP_LOG_DEBUG);
 
-        // Send to transport (could be UART, SPI, I2C, etc.)
-        serial_handler_send_data(buf, rx_size);
+        // Claim/refresh USB ownership of the UART; only drive the target if we own
+        // it (a network RFC2217 session may currently hold the lock).
+        serial_handler_mark_usb_activity();
+        if (serial_handler_owner() == SERIAL_OWNER_USB) {
+            // Send to transport (could be UART, SPI, I2C, etc.)
+            serial_handler_send_data(buf, rx_size);
+        }
     } else {
         ESP_LOGW(TAG, "tud_cdc_rx_cb receive error");
     }
