@@ -34,6 +34,7 @@ static atomic_bool s_fatal = false;
 static atomic_uint_least32_t s_tx_tick = 0;
 static atomic_uint_least32_t s_rx_tick = 0;
 static atomic_uint_least32_t s_dbg_tick = 0;
+static volatile led_wifi_state_t s_wifi = LED_WIFI_OFF;
 
 static inline uint8_t scale8(uint32_t v, uint32_t pct)
 {
@@ -73,29 +74,46 @@ static void render_task(void *arg)
             const bool debug = recent(&s_dbg_tick, now, dbg_ticks);
             const bool mounted = atomic_load(&s_mounted);
 
-            // Priority: FLASHING > DEBUG > READY(+blips) > IDLE.
+            // Priority: FLASHING > DEBUG > traffic blips > WiFi tint / READY / IDLE.
             if (flashing) {
                 // Solid blue with a gentle flicker.
                 const uint8_t b = ((now / pdMS_TO_TICKS(70)) % 4 == 0) ? 150 : 255;
                 put(0, 0, b);
             } else if (debug) {
                 put(128, 0, 255); // purple
-            } else if (mounted) {
-                if (recent(&s_tx_tick, now, blip_ticks)) {
-                    put(0, 0, 255);   // blue: bridge -> target
-                } else if (recent(&s_rx_tick, now, blip_ticks)) {
-                    put(0, 255, 255); // cyan: target -> bridge
-                } else {
-                    // Ready heartbeat: breathe green, never fully off.
-                    const uint32_t pos = now % breathe_ticks;
-                    const uint32_t half = breathe_ticks / 2;
-                    const uint32_t tri = (pos < half) ? (pos * 100 / half)
-                                                      : (100 - (pos - half) * 100 / half);
-                    const uint32_t level = 15 + tri * 85 / 100; // 15..100
-                    put(0, (uint8_t)(255 * level / 100), 0);
-                }
+            } else if (mounted && recent(&s_tx_tick, now, blip_ticks)) {
+                put(0, 0, 255);   // blue: bridge -> target
+            } else if (mounted && recent(&s_rx_tick, now, blip_ticks)) {
+                put(0, 255, 255); // cyan: target -> bridge
             } else {
-                put(0, 255, 0); // idle (no host yet): solid green
+                // Resting base tint. When WiFi is armed it takes over the green
+                // idle/ready base (orange); otherwise green ready/idle as before.
+                const led_wifi_state_t wifi = s_wifi;
+                if (wifi == LED_WIFI_CONNECTING) {
+                    const bool on = ((now / pdMS_TO_TICKS(250)) % 2) == 0;
+                    put(on ? 255 : 0, on ? 90 : 0, 0);   // blink orange ~2 Hz
+                } else if (wifi == LED_WIFI_FAILED) {
+                    const bool on = ((now / pdMS_TO_TICKS(1000)) % 2) == 0;
+                    put(on ? 255 : 0, on ? 90 : 0, 0);   // slow blink orange
+                } else {
+                    // breathe (ready/connected) or solid (idle). Color: orange if
+                    // WiFi connected, else green.
+                    const bool orange = (wifi == LED_WIFI_CONNECTED);
+                    if (mounted || orange) {
+                        const uint32_t pos = now % breathe_ticks;
+                        const uint32_t half = breathe_ticks / 2;
+                        const uint32_t tri = (pos < half) ? (pos * 100 / half)
+                                                          : (100 - (pos - half) * 100 / half);
+                        const uint32_t level = 15 + tri * 85 / 100; // 15..100
+                        if (orange) {
+                            put((uint8_t)(255 * level / 100), (uint8_t)(90 * level / 100), 0);
+                        } else {
+                            put(0, (uint8_t)(255 * level / 100), 0);
+                        }
+                    } else {
+                        put(0, 255, 0); // idle (no host yet): solid green
+                    }
+                }
             }
         }
         vTaskDelay(pdMS_TO_TICKS(RENDER_PERIOD_MS));
@@ -156,6 +174,11 @@ void status_led_notify_debug(void)
     atomic_store(&s_dbg_tick, (uint_least32_t) xTaskGetTickCount());
 }
 
+void status_led_set_wifi(led_wifi_state_t s)
+{
+    s_wifi = s;
+}
+
 void status_led_fatal(void)
 {
     atomic_store(&s_fatal, true);
@@ -180,5 +203,6 @@ void status_led_blip_tx(void) {}
 void status_led_blip_rx(void) {}
 void status_led_notify_debug(void) {}
 void status_led_fatal(void) {}
+void status_led_set_wifi(led_wifi_state_t s) { (void) s; }
 
 #endif // CONFIG_STATUS_LED_WS2812

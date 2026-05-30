@@ -38,6 +38,16 @@ void status_led_notify_debug(void);
 // Blocking red-blink for fatal errors (called from eub_abort, which then aborts).
 void status_led_fatal(void);
 
+// WiFi state as an orthogonal base tint (orange), shown when otherwise idle/ready.
+// Flashing / debug / error / activity blips still take priority over it.
+typedef enum {
+    LED_WIFI_OFF = 0,    // disarmed: green idle/ready base
+    LED_WIFI_CONNECTING, // blinking orange
+    LED_WIFI_CONNECTED,  // steady (breathing) orange
+    LED_WIFI_FAILED      // slow-blink orange
+} led_wifi_state_t;
+void status_led_set_wifi(led_wifi_state_t s);
+
 #ifdef __cplusplus
 }
 #endif
