@@ -13,3 +13,7 @@ main/pinout_md.gen.c
 *.stackdump
 pio_build.log
 pio_upload.log
+
+# Host unit-test binaries
+components/wireless/test/host/t
+components/wireless/test/host/t.exe
