@@ -24,4 +24,27 @@ menu "Serial Handler Configuration"
         help
             GPIO pin for UART transmit (TxD) to target
 
+    config SERIAL_HANDLER_TXD_RELEASE_WHEN_IDLE
+        bool "Release TxD to high-impedance when idle"
+        default n
+        help
+            When enabled, the UART TxD line to the target is driven push-pull only
+            while a programming/monitor session is active, and released to a true
+            high-impedance state when idle. This lets a target repurpose its RX pin
+            at runtime (e.g. as a display control line) without the dormant bridge
+            holding it. Release is triggered by the target's reset-to-run transition
+            (the reboot esptool issues at the end of a session), with an inactivity
+            timeout as a backstop. TxD is never open-drain.
+
+    config SERIAL_HANDLER_TXD_IDLE_MS
+        int "TxD idle backstop timeout (ms)"
+        depends on SERIAL_HANDLER_TXD_RELEASE_WHEN_IDLE
+        default 3000
+        help
+            Backstop only: if no reset-to-run is observed (e.g. esptool
+            --after no_reset, a terminal that just closes, or raw UART use), release
+            TxD to Hi-Z after this many milliseconds of no host->target traffic.
+            Must comfortably exceed the longest in-session silent gap, such as a
+            flash-erase wait.
+
 endmenu

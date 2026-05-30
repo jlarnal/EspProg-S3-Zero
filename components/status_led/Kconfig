@@ -1,0 +1,30 @@
+menu "Status LED Configuration"
+
+    config STATUS_LED_WS2812
+        bool "Use a WS2812 (NeoPixel) RGB LED for status"
+        default n
+        help
+            Drive a single addressable WS2812 RGB LED as the status indicator
+            instead of the three discrete GPIO activity LEDs. The color encodes
+            the bridge mode: solid green = idle (no host), breathing green =
+            ready, blue = flashing, purple = JTAG/SWD debug, fast red blink =
+            fatal error; brief blue/cyan blips show bridge<->target traffic.
+
+    config STATUS_LED_GPIO
+        int "WS2812 data GPIO"
+        depends on STATUS_LED_WS2812
+        default 21
+        help
+            GPIO connected to the WS2812 data-in. On the Waveshare ESP32-S3-Zero
+            the onboard RGB LED is on GPIO21.
+
+    config STATUS_LED_BRIGHTNESS
+        int "WS2812 brightness percent (1-100)"
+        depends on STATUS_LED_WS2812
+        range 1 100
+        default 20
+        help
+            Global brightness scaling applied to every color. WS2812s are very
+            bright; 20% is usually plenty for an indicator.
+
+endmenu

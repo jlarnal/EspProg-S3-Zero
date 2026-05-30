@@ -144,6 +144,7 @@ static const uint8_t msc_disk_fat_table_sector0[] = {
     0xF8, 0xFF,
     0xFF, 0xFF,
     0xFF, 0xFF, // Cluster no. 2 - Readme file start and end
+    0xFF, 0xFF, // Cluster no. 3 - Pinout file start and end
 };
 
 static const uint8_t msc_disk_readme_sector0[] =
@@ -152,6 +153,16 @@ static const uint8_t msc_disk_readme_sector0[] =
 
 #define MSC_README_SIZE     (sizeof(msc_disk_readme_sector0) - 1)
 _Static_assert(MSC_README_SIZE < FAT_SECTOR_SIZE, "Only the first sector of the README is stored in RAM");
+
+// PINOUT.MD served by the MSC drive is the repo's pinout.md, turned into this byte
+// array at build time by main/CMakeLists.txt (-> pinout_md.gen.c). Single source of
+// truth: the drive file and the repo file can never diverge. Served from cluster 3;
+// it may span that cluster's sectors and is clamped to one cluster (4096 bytes).
+extern const unsigned char pinout_md[];
+extern const unsigned int pinout_md_len;
+#define msc_disk_pinout     pinout_md
+#define MSC_PINOUT_MAX      (FAT_SECTORS_PER_CLUSTER * FAT_SECTOR_SIZE)
+#define MSC_PINOUT_SIZE     ((uint32_t)pinout_md_len)
 
 static uint8_t msc_disk_root_directory_sector0[] = {
     ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ',
@@ -165,6 +176,12 @@ static uint8_t msc_disk_root_directory_sector0[] = {
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // time and date for creation & modification
     0x02, 0, // starting cluster in the FAT table
     GET_BYTE(MSC_README_SIZE, 0), GET_BYTE(MSC_README_SIZE, 1), GET_BYTE(MSC_README_SIZE, 2), GET_BYTE(MSC_README_SIZE, 3), // size
+    // pinout file
+    'P', 'I', 'N', 'O', 'U', 'T', ' ', ' ', 'M', 'D', ' ',
+    0x01, // attribute byte where read-only bit is set
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // time and date for creation & modification
+    0x03, 0, // starting cluster in the FAT table
+    0, 0, 0, 0, // size: patched at runtime in msc_init() from the embedded pinout.md
 };
 
 void tud_msc_inquiry_cb(const uint8_t lun, uint8_t vendor_id[8], uint8_t product_id[16], uint8_t product_rev[4])
@@ -225,11 +242,13 @@ bool tud_msc_start_stop_cb(const uint8_t lun, const uint8_t power_condition, con
 #define FIRST_FAT_SECTOR      FAT_BOOT_SECTORS
 #define FIRST_ROOT_SECTOR     (FIRST_FAT_SECTOR + FAT_TABLE_SECTORS)
 #define FIRST_README_SECTOR   (FIRST_ROOT_SECTOR + FAT_ROOT_SECTORS)
-#define FIRST_ELSE_SECTOR     (FIRST_README_SECTOR + FAT_SECTORS_PER_CLUSTER)
+#define FIRST_PINOUT_SECTOR   (FIRST_README_SECTOR + FAT_SECTORS_PER_CLUSTER)
+#define FIRST_ELSE_SECTOR     (FIRST_PINOUT_SECTOR + FAT_SECTORS_PER_CLUSTER)
 #define IS_LBA_BOOT(lba)      ((lba) < FIRST_FAT_SECTOR)
 #define IS_LBA_FAT(lba)       ((lba) >= FIRST_FAT_SECTOR && (lba) < FIRST_ROOT_SECTOR)
 #define IS_LBA_ROOT(lba)      ((lba) >= FIRST_ROOT_SECTOR && (lba) < FIRST_README_SECTOR)
-#define IS_LBA_README(lba)    ((lba) >= FIRST_README_SECTOR && (lba) < FIRST_ELSE_SECTOR)
+#define IS_LBA_README(lba)    ((lba) >= FIRST_README_SECTOR && (lba) < FIRST_PINOUT_SECTOR)
+#define IS_LBA_PINOUT(lba)    ((lba) >= FIRST_PINOUT_SECTOR && (lba) < FIRST_ELSE_SECTOR)
 #define IS_LBA_ELSE(lba)      ((lba) >= FIRST_ELSE_SECTOR)
 
 int32_t tud_msc_read10_cb(const uint8_t lun, const uint32_t lba, const uint32_t offset, void *buffer, const uint32_t bufsize)
@@ -250,6 +269,16 @@ int32_t tud_msc_read10_cb(const uint8_t lun, const uint32_t lba, const uint32_t 
     } else if (lba == FIRST_README_SECTOR) {
         addr = msc_disk_readme_sector0;
         size = sizeof(msc_disk_readme_sector0);
+    } else if (IS_LBA_PINOUT(lba)) {
+        // PINOUT.MD may span several sectors within its cluster.
+        const uint32_t pin_off = (lba - FIRST_PINOUT_SECTOR) * FAT_SECTOR_SIZE;
+        if (pin_off < MSC_PINOUT_SIZE) {
+            addr = (const uint8_t *) msc_disk_pinout + pin_off;
+            size = MSC_PINOUT_SIZE - pin_off;
+            if (size > FAT_SECTOR_SIZE) {
+                size = FAT_SECTOR_SIZE;
+            }
+        }
     } // else lba sector is not kept in RAM
 
     int done = 0;
@@ -573,6 +602,17 @@ void msc_init(void)
            FAT_VOLUME_NAME_SIZE - strlen(CONFIG_BRIDGE_MSC_VOLUME_LABEL));
     memcpy(msc_disk_boot_sector.volume, volume_label, FAT_VOLUME_NAME_SIZE);
     memcpy(msc_disk_root_directory_sector0, volume_label, FAT_VOLUME_NAME_SIZE);
+
+    // Patch the PINOUT.MD directory-entry file size (4 bytes at offset 28 of the
+    // 3rd 32-byte entry) from the embedded pinout.md length, clamped to one cluster.
+    uint32_t pinout_size = MSC_PINOUT_SIZE;
+    if (pinout_size > MSC_PINOUT_MAX) {
+        pinout_size = MSC_PINOUT_MAX;
+    }
+    const size_t pinout_size_offset = 2 * FAT_ROOT_ENTRY_SIZE + 28;
+    for (int i = 0; i < 4; ++i) {
+        msc_disk_root_directory_sector0[pinout_size_offset + i] = GET_BYTE(pinout_size, i);
+    }
 
     ESP_LOG_BUFFER_HEXDUMP("boot", &msc_disk_boot_sector, sizeof(msc_boot_sector_t), ESP_LOG_DEBUG);
     ESP_LOG_BUFFER_HEXDUMP("fat", msc_disk_fat_table_sector0, sizeof(msc_disk_fat_table_sector0), ESP_LOG_DEBUG);

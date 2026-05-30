@@ -24,6 +24,7 @@
 #include "esp_loader.h"
 #include "esp32_port.h"
 #include "esp_timer.h"
+#include "esp_rom_sys.h"
 
 #define KB(x) ((x) * 1024)
 
@@ -61,6 +62,99 @@ typedef struct {
 } transport_state_t;
 
 static transport_state_t s_transport = {0};
+
+#if CONFIG_SERIAL_HANDLER_TXD_RELEASE_WHEN_IDLE
+// --- TxD pad ownership -------------------------------------------------------
+// TxD is push-pull only while a programming/monitor session is active; when idle
+// it is released to a true high-impedance state so a target that repurposes its
+// RX pin at runtime (e.g. as a display control line) is not held by the dormant
+// bridge. Release is driven by the target's reset-to-RUN transition (the reboot
+// esptool issues at the end of a session), with an inactivity timeout as a
+// backstop. TxD is never open-drain. See the txd-hiz-release-policy design note.
+#define TXD_RUN_RELEASE_MARGIN_MS 30
+
+typedef enum { TX_RELEASED, TX_ATTACHED } tx_owner_state_t;
+static tx_owner_state_t s_tx_state = TX_RELEASED;
+static SemaphoreHandle_t s_tx_mutex = NULL;
+static esp_timer_handle_t s_tx_release_timer = NULL;
+static atomic_bool s_target_running = true;
+
+// Re-bind GPIO_TXD to the UART TX signal (push-pull). Caller must hold s_tx_mutex.
+// uart_set_pin routes a non-IOMUX pin via the GPIO matrix and asserts the pad
+// output-enable only after connecting the signal, so the pad snaps to the UART
+// idle-HIGH mark rather than emitting a spurious start bit.
+static void tx_attach_locked(void)
+{
+    if (s_tx_state == TX_ATTACHED) {
+        return;
+    }
+    uart_set_pin(SLAVE_UART_NUM, GPIO_TXD, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    esp_rom_delay_us(50); // let the line settle at idle HIGH before the first start bit
+    s_tx_state = TX_ATTACHED;
+}
+
+// Release GPIO_TXD to true Hi-Z. Clearing the pad output-enable disconnects the
+// drive even though the UART out-signal stays routed in the matrix; no internal
+// pull is applied so the target fully owns the line (idle bias, if a board needs
+// it, is an external pull-up on the net). Caller must hold s_tx_mutex.
+static void tx_release_locked(void)
+{
+    if (s_tx_state == TX_RELEASED) {
+        return;
+    }
+    gpio_set_direction(GPIO_TXD, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(GPIO_TXD, GPIO_FLOATING);
+    s_tx_state = TX_RELEASED;
+}
+
+static void tx_arm_release_timer(uint32_t ms)
+{
+    if (s_tx_release_timer == NULL) {
+        return;
+    }
+    esp_timer_stop(s_tx_release_timer); // harmless if not running
+    esp_timer_start_once(s_tx_release_timer, (uint64_t)ms * 1000);
+}
+
+// Attach TxD if needed and (re)arm the inactivity backstop. Safe from any task.
+static void tx_acquire(void)
+{
+    if (s_tx_mutex == NULL) {
+        return;
+    }
+    xSemaphoreTake(s_tx_mutex, portMAX_DELAY);
+    tx_attach_locked();
+    tx_arm_release_timer(CONFIG_SERIAL_HANDLER_TXD_IDLE_MS);
+    xSemaphoreGive(s_tx_mutex);
+}
+
+static void tx_release_timer_cb(void *arg)
+{
+    (void) arg;
+    if (s_tx_mutex == NULL) {
+        return;
+    }
+    xSemaphoreTake(s_tx_mutex, portMAX_DELAY);
+    // Never release mid-flash, during the post-flash reset window, or before the
+    // target has actually been released to run its application.
+    if (atomic_load(&s_transport.is_flashing) ||
+            serial_handler_is_reset_active() ||
+            !atomic_load(&s_target_running)) {
+        tx_arm_release_timer(CONFIG_SERIAL_HANDLER_TXD_IDLE_MS);
+        xSemaphoreGive(s_tx_mutex);
+        return;
+    }
+    // Make sure the shifter/FIFO is drained so a frame is never truncated; if not,
+    // defer rather than cut the line mid-byte.
+    if (uart_wait_tx_done(SLAVE_UART_NUM, pdMS_TO_TICKS(20)) != ESP_OK) {
+        tx_arm_release_timer(CONFIG_SERIAL_HANDLER_TXD_IDLE_MS);
+        xSemaphoreGive(s_tx_mutex);
+        return;
+    }
+    tx_release_locked();
+    xSemaphoreGive(s_tx_mutex);
+}
+#endif // CONFIG_SERIAL_HANDLER_TXD_RELEASE_WHEN_IDLE
 
 void serial_handler_register_tx_activity_callback(serial_tx_notify_cb_t callback)
 {
@@ -169,6 +263,27 @@ static esp_err_t init_uart_transport(void)
         ESP_RETURN_ON_ERROR(gpio_pullup_en(GPIO_RST), TAG, "Failed to enable pull up for RST");
         ESP_RETURN_ON_ERROR(gpio_set_level(GPIO_RST, 1), TAG, "Failed to release reset pin");
 
+#if CONFIG_SERIAL_HANDLER_TXD_RELEASE_WHEN_IDLE
+        // Set up TxD pad ownership. loader_port_esp32_init left GPIO_TXD bound to
+        // the UART as a push-pull output idling HIGH; start from the defined idle
+        // state by releasing it to Hi-Z until the first session begins.
+        s_tx_mutex = xSemaphoreCreateMutex();
+        if (s_tx_mutex == NULL) {
+            ESP_LOGE(TAG, "Failed to create TxD mutex");
+            return ESP_ERR_NO_MEM;
+        }
+        const esp_timer_create_args_t tx_timer_args = {
+            .callback = tx_release_timer_cb,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "serial_txd_release",
+        };
+        ESP_RETURN_ON_ERROR(esp_timer_create(&tx_timer_args, &s_tx_release_timer), TAG, "Failed to create TxD release timer");
+        xSemaphoreTake(s_tx_mutex, portMAX_DELAY);
+        s_tx_state = TX_ATTACHED; // currently driven by the UART after init
+        tx_release_locked();      // -> Hi-Z idle state
+        xSemaphoreGive(s_tx_mutex);
+#endif
+
         ESP_LOGI(TAG, "UART have been initialized");
 
         // Start UART event task
@@ -251,6 +366,9 @@ esp_err_t serial_handler_send_data(const uint8_t *data, size_t len)
 
     switch (s_transport.type) {
     case TRANSPORT_TYPE_UART: {
+#if CONFIG_SERIAL_HANDLER_TXD_RELEASE_WHEN_IDLE
+        tx_acquire(); // ensure TxD is push-pull before the first byte; re-arm the backstop
+#endif
         serial_notify_tx_activity(true);
         const int transferred = uart_write_bytes(SLAVE_UART_NUM, data, len);
         serial_notify_tx_activity(false);
@@ -306,6 +424,10 @@ esp_err_t serial_handler_flash_connect(uint32_t baud_rate)
         ESP_LOGE(TAG, "Already flashing");
         return ESP_ERR_INVALID_STATE;
     }
+
+#if CONFIG_SERIAL_HANDLER_TXD_RELEASE_WHEN_IDLE
+    tx_acquire(); // the loader is about to drive the target; keep TxD push-pull
+#endif
 
     // Take exclusive access for flashing
     atomic_store(&s_transport.is_flashing, true);
@@ -504,4 +626,30 @@ void serial_handler_set_boot_reset_pins(bool boot_pin, bool reset_pin)
     gpio_set_level(GPIO_BOOT, boot_pin);
     gpio_set_level(GPIO_RST, reset_pin);
     ESP_LOGD(TAG, "BOOT=%s, RST=%s", boot_pin ? "HIGH" : "LOW", reset_pin ? "HIGH" : "LOW");
+
+#if CONFIG_SERIAL_HANDLER_TXD_RELEASE_WHEN_IDLE
+    // Drive TxD attach/release off the target's boot/reset edges. This is the
+    // single chokepoint both the CDC auto-reset path and the post-flash reset
+    // funnel through. A reset released with BOOT low => target enters DOWNLOAD
+    // (session active, keep TxD driven); released with BOOT high => target enters
+    // RUN (the end-of-session reboot) => schedule TxD release so we go Hi-Z as the
+    // app starts and may repurpose its RX pin. The inactivity timer is the backstop.
+    static bool s_prev_rst = true; // assumed out of reset at power-up
+    const bool rst_rising = (!s_prev_rst && reset_pin);
+    s_prev_rst = reset_pin;
+
+    if (!boot_pin || !reset_pin) {
+        // A reset/boot manipulation is under way: a programming session is
+        // (re)starting. Make sure TxD is driving before any SYNC byte.
+        atomic_store(&s_target_running, false);
+        tx_acquire();
+    } else if (rst_rising) {
+        atomic_store(&s_target_running, true);
+        if (s_tx_mutex != NULL) {
+            xSemaphoreTake(s_tx_mutex, portMAX_DELAY);
+            tx_arm_release_timer(TXD_RUN_RELEASE_MARGIN_MS);
+            xSemaphoreGive(s_tx_mutex);
+        }
+    }
+#endif
 }

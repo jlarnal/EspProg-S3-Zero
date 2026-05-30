@@ -3,3 +3,13 @@ managed_components/
 sdkconfig
 sdkconfig.old
 dependencies.lock
+# PlatformIO build artifacts and generated sources
+.pio/
+sdkconfig.s3zero_jtag
+main/pinout_md.gen.c
+
+# Editor config (machine-specific include paths) and run/crash logs
+.vscode/
+*.stackdump
+pio_build.log
+pio_upload.log

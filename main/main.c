@@ -22,6 +22,7 @@
 #include "debug_probe.h"
 #include "usb_defs.h"
 #include "led_io.h"
+#include "status_led.h"
 
 static const char *TAG = "bridge_main";
 
@@ -125,12 +126,20 @@ uint8_t const *tud_descriptor_device_cb(void)
 
 static void debug_activity_callback(bool active)
 {
+#if CONFIG_STATUS_LED_WS2812
+    if (active) {
+        status_led_notify_debug();
+    }
+#else
     gpio_set_level(LED_JTAG, active ? LED_JTAG_ON : LED_JTAG_OFF);
+#endif
 }
 
 void tud_mount_cb(void)
 {
     ESP_LOGI(TAG, "Mounted");
+
+    status_led_set_mounted(true);
 
     eub_vendord_start();
 
@@ -140,6 +149,12 @@ void tud_mount_cb(void)
         eub_abort();
     }
     debug_probe_register_activity_callback(debug_activity_callback);
+}
+
+void tud_umount_cb(void)
+{
+    ESP_LOGI(TAG, "Unmounted");
+    status_led_set_mounted(false);
 }
 
 static void init_serial_no(void)
@@ -203,14 +218,27 @@ static void tusb_device_task(void *pvParameters)
 // LEDs TX and RX are swapped in the code to indicate activity from the bridge to the target
 static void serial_tx_activity_callback(bool active)
 {
+#if CONFIG_STATUS_LED_WS2812
+    if (active) {
+        status_led_blip_tx(); // bridge -> target
+    }
+#else
     gpio_set_level(LED_RX, active ? LED_RX_ON : LED_RX_OFF);
+#endif
 }
 
 static void serial_rx_activity_callback(bool active)
 {
+#if CONFIG_STATUS_LED_WS2812
+    if (active) {
+        status_led_blip_rx(); // target -> bridge
+    }
+#else
     gpio_set_level(LED_TX, active ? LED_TX_ON : LED_TX_OFF);
+#endif
 }
 
+#if !CONFIG_STATUS_LED_WS2812
 static void init_led_gpios(void)
 {
     gpio_config_t io_conf = {};
@@ -228,6 +256,7 @@ static void init_led_gpios(void)
 
     ESP_LOGI(TAG, "LED GPIO init done");
 }
+#endif
 
 static void int_usb_phy(void)
 {
@@ -245,7 +274,12 @@ static void int_usb_phy(void)
 
 void app_main(void)
 {
-    init_led_gpios(); // Keep this at the beginning. LEDs are used for error reporting.
+    // Keep LED init at the beginning. LEDs are used for error reporting.
+#if CONFIG_STATUS_LED_WS2812
+    ESP_ERROR_CHECK(status_led_init());
+#else
+    init_led_gpios();
+#endif
 
     init_serial_no();
 

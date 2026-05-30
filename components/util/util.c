@@ -11,9 +11,15 @@
 #include "util.h"
 #include "sdkconfig.h"
 #include "led_io.h"
+#if CONFIG_STATUS_LED_WS2812
+#include "status_led.h"
+#endif
 
 void __attribute__((noreturn)) eub_abort(void)
 {
+#if CONFIG_STATUS_LED_WS2812
+    status_led_fatal(); // blocking red blink on the WS2812
+#else
     const int led_patterns[][3] = {
         {LED_TX_ON,  LED_RX_ON,  LED_JTAG_ON},
         {LED_TX_ON,  LED_RX_OFF, LED_JTAG_ON},
@@ -30,6 +36,7 @@ void __attribute__((noreturn)) eub_abort(void)
         gpio_set_level(LED_JTAG, led_patterns[i][2]);
         vTaskDelay(pdMS_TO_TICKS(500));
     }
+#endif
 
     abort();
 }

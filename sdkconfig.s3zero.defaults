@@ -1,0 +1,51 @@
+# Combined sdkconfig defaults for the PlatformIO build of esp-usb-bridge
+# targeting the Waveshare ESP32-S3-Zero. Mirrors what idf.py would layer from
+# sdkconfig.defaults + sdkconfig.defaults.esp32s3 + sdkconfig.jtag.defaults,
+# collapsed into one file because PlatformIO does not auto-layer the
+# per-target / per-interface presets the way idf.py does.
+
+# --- base (sdkconfig.defaults) ---
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=n
+CONFIG_SERIAL_FLASHER_MD5_ENABLED=y
+
+# --- esp32s3 performance (sdkconfig.defaults.esp32s3) ---
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=240
+CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
+CONFIG_ESP32S3_DATA_CACHE_64KB=y
+
+# --- flash: Waveshare ESP32-S3-Zero has 4MB embedded quad flash (verified via
+#     esptool flash-id on the actual chip; upstream default of 2MB was wrong) ---
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
+
+# --- PSRAM: 2MB embedded quad PSRAM (AP_3v3). Autodetect handles the 2MB size. ---
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_QUAD=y
+CONFIG_SPIRAM_TYPE_AUTO=y
+CONFIG_SPIRAM_SPEED_80M=y
+
+# --- bridge<->target line GPIOs: all on the S3-Zero right castellated edge ---
+# (verified pad layout, see ESP32-S3-Zero-details-inter.jpg). GP3 (strapping) and
+# the backside SMD pads are deliberately avoided.
+CONFIG_SERIAL_HANDLER_GPIO_TXD=13
+CONFIG_SERIAL_HANDLER_GPIO_RXD=12
+CONFIG_SERIAL_HANDLER_GPIO_BOOT=11
+CONFIG_SERIAL_HANDLER_GPIO_RST=10
+CONFIG_DEBUG_PROBE_GPIO_TDI=9
+CONFIG_DEBUG_PROBE_GPIO_TDO=8
+CONFIG_DEBUG_PROBE_GPIO_TCK=7
+CONFIG_DEBUG_PROBE_GPIO_TMS=16
+
+# --- TxD goes high-impedance when idle (target may repurpose its RX pin) ---
+CONFIG_SERIAL_HANDLER_TXD_RELEASE_WHEN_IDLE=y
+CONFIG_SERIAL_HANDLER_TXD_IDLE_MS=3000
+
+# --- WS2812 RGB status LED (onboard, GPIO21) instead of 3 discrete GPIO LEDs ---
+CONFIG_STATUS_LED_WS2812=y
+CONFIG_STATUS_LED_GPIO=21
+CONFIG_STATUS_LED_BRIGHTNESS=20
+
+# --- debug probe interface: JTAG (sdkconfig.jtag.defaults) ---
+CONFIG_DEBUG_PROBE_IFACE_JTAG=y
+CONFIG_DEBUG_PROBE_IFACE_NAME="JTAG"
