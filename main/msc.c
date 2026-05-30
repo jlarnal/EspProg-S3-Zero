@@ -31,6 +31,7 @@
 #include "msc.h"
 #include "util.h"
 #include "serial_handler.h"
+#include "wireless.h"
 #include "sdkconfig.h"
 #define KB(x) ((x) * 1024)
 
@@ -145,6 +146,7 @@ static const uint8_t msc_disk_fat_table_sector0[] = {
     0xFF, 0xFF,
     0xFF, 0xFF, // Cluster no. 2 - Readme file start and end
     0xFF, 0xFF, // Cluster no. 3 - Pinout file start and end
+    0xFF, 0xFF, // Cluster no. 4 - WIFI.TXT start and end
 };
 
 static const uint8_t msc_disk_readme_sector0[] =
@@ -182,6 +184,12 @@ static uint8_t msc_disk_root_directory_sector0[] = {
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // time and date for creation & modification
     0x03, 0, // starting cluster in the FAT table
     0, 0, 0, 0, // size: patched at runtime in msc_init() from the embedded pinout.md
+    // wifi.txt file (writable: archive attribute, not read-only)
+    'W', 'I', 'F', 'I', ' ', ' ', ' ', ' ', 'T', 'X', 'T',
+    0x20, // archive attribute (read-write)
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // time and date for creation & modification
+    0x04, 0, // starting cluster in the FAT table
+    0, 0, 0, 0, // size: refreshed at runtime from the wireless cache (read10 ROOT branch)
 };
 
 void tud_msc_inquiry_cb(const uint8_t lun, uint8_t vendor_id[8], uint8_t product_id[16], uint8_t product_rev[4])
@@ -243,12 +251,14 @@ bool tud_msc_start_stop_cb(const uint8_t lun, const uint8_t power_condition, con
 #define FIRST_ROOT_SECTOR     (FIRST_FAT_SECTOR + FAT_TABLE_SECTORS)
 #define FIRST_README_SECTOR   (FIRST_ROOT_SECTOR + FAT_ROOT_SECTORS)
 #define FIRST_PINOUT_SECTOR   (FIRST_README_SECTOR + FAT_SECTORS_PER_CLUSTER)
-#define FIRST_ELSE_SECTOR     (FIRST_PINOUT_SECTOR + FAT_SECTORS_PER_CLUSTER)
+#define FIRST_WIFI_SECTOR     (FIRST_PINOUT_SECTOR + FAT_SECTORS_PER_CLUSTER)
+#define FIRST_ELSE_SECTOR     (FIRST_WIFI_SECTOR + FAT_SECTORS_PER_CLUSTER)
 #define IS_LBA_BOOT(lba)      ((lba) < FIRST_FAT_SECTOR)
 #define IS_LBA_FAT(lba)       ((lba) >= FIRST_FAT_SECTOR && (lba) < FIRST_ROOT_SECTOR)
 #define IS_LBA_ROOT(lba)      ((lba) >= FIRST_ROOT_SECTOR && (lba) < FIRST_README_SECTOR)
 #define IS_LBA_README(lba)    ((lba) >= FIRST_README_SECTOR && (lba) < FIRST_PINOUT_SECTOR)
-#define IS_LBA_PINOUT(lba)    ((lba) >= FIRST_PINOUT_SECTOR && (lba) < FIRST_ELSE_SECTOR)
+#define IS_LBA_PINOUT(lba)    ((lba) >= FIRST_PINOUT_SECTOR && (lba) < FIRST_WIFI_SECTOR)
+#define IS_LBA_WIFI(lba)      ((lba) >= FIRST_WIFI_SECTOR && (lba) < FIRST_ELSE_SECTOR)
 #define IS_LBA_ELSE(lba)      ((lba) >= FIRST_ELSE_SECTOR)
 
 int32_t tud_msc_read10_cb(const uint8_t lun, const uint32_t lba, const uint32_t offset, void *buffer, const uint32_t bufsize)
@@ -264,6 +274,15 @@ int32_t tud_msc_read10_cb(const uint8_t lun, const uint32_t lba, const uint32_t 
         addr = msc_disk_fat_table_sector0;
         size = sizeof(msc_disk_fat_table_sector0);
     } else if (lba == FIRST_ROOT_SECTOR) {
+        // Refresh WIFI.TXT's dir-entry size (4th entry, index 3) from the wireless
+        // cache, so the host sees the current length on mount / remount.
+        const char *wbuf;
+        uint32_t wlen;
+        wireless_wifi_txt(&wbuf, &wlen);
+        const size_t wifi_size_off = 3 * FAT_ROOT_ENTRY_SIZE + 28;
+        for (int i = 0; i < 4; ++i) {
+            msc_disk_root_directory_sector0[wifi_size_off + i] = GET_BYTE(wlen, i);
+        }
         addr = msc_disk_root_directory_sector0;
         size = sizeof(msc_disk_root_directory_sector0);
     } else if (lba == FIRST_README_SECTOR) {
@@ -275,6 +294,19 @@ int32_t tud_msc_read10_cb(const uint8_t lun, const uint32_t lba, const uint32_t 
         if (pin_off < MSC_PINOUT_SIZE) {
             addr = (const uint8_t *) msc_disk_pinout + pin_off;
             size = MSC_PINOUT_SIZE - pin_off;
+            if (size > FAT_SECTOR_SIZE) {
+                size = FAT_SECTOR_SIZE;
+            }
+        }
+    } else if (IS_LBA_WIFI(lba)) {
+        // WIFI.TXT is served live from the wireless cache (may span sectors).
+        const char *wbuf;
+        uint32_t wlen;
+        wireless_wifi_txt(&wbuf, &wlen);
+        const uint32_t wifi_off = (lba - FIRST_WIFI_SECTOR) * FAT_SECTOR_SIZE;
+        if (wifi_off < wlen) {
+            addr = (const uint8_t *) wbuf + wifi_off;
+            size = wlen - wifi_off;
             if (size > FAT_SECTOR_SIZE) {
                 size = FAT_SECTOR_SIZE;
             }
@@ -367,6 +399,13 @@ static const char *chipid_to_name(const uint32_t id)
 #define MSC_FLASH_DEFAULT_BAUDRATE          115200
 
 static int msc_last_block_written = -1;
+
+// WIFI.TXT host-write capture: sectors of the wifi cluster are accumulated here,
+// the declared file size is taken from the root-dir entry the host rewrites, and
+// on write-complete the content is handed to the wireless credential layer.
+static uint8_t  s_wifi_wbuf[FAT_SECTORS_PER_CLUSTER * FAT_SECTOR_SIZE];
+static uint32_t s_wifi_declared_size = 0;
+static bool     s_wifi_dirty = false;
 
 static bool msc_change_baudrate(const uint32_t chip_id, const uint32_t baud)
 {
@@ -516,6 +555,23 @@ int32_t tud_msc_write10_cb(const uint8_t lun, const uint32_t lba, const uint32_t
         return 0;
     }
 
+    // WIFI.TXT lives in its own cluster: capture host writes (parsed on completion).
+    if (IS_LBA_WIFI(lba)) {
+        const uint32_t off = (lba - FIRST_WIFI_SECTOR) * FAT_SECTOR_SIZE + offset;
+        if (off + bufsize <= sizeof(s_wifi_wbuf)) {
+            memcpy(s_wifi_wbuf + off, buffer, bufsize);
+            s_wifi_dirty = true;
+        }
+        return bufsize;   // not a UF2 block
+    }
+    // The host rewrites the root dir with WIFI.TXT's new size; grab it (4th entry,
+    // index 3; size field at 3*32 + 28 = 124).
+    if (IS_LBA_ROOT(lba) && offset == 0 && bufsize >= 4 * FAT_ROOT_ENTRY_SIZE) {
+        const uint8_t *e = buffer + (3 * FAT_ROOT_ENTRY_SIZE + 28);
+        s_wifi_declared_size = e[0] | (e[1] << 8) | (e[2] << 16) | ((uint32_t)e[3] << 24);
+        // fall through: root writes are otherwise ignored by the synthetic FS
+    }
+
     // Linux and Windows write files differently. Windows also creates system volume information files on the first
     // mount. In an ideal case, FAT and ROOT content would be analyzed and the flash file detected.
     // However, the only reliable way to detect files for flashing is look at the content.
@@ -564,6 +620,22 @@ void tud_msc_write10_complete_cb(uint8_t lun)
             eub_abort();
         }
         msc_last_block_written = -1;
+    }
+
+    // A WIFI.TXT host write completed: hand the captured content to the credential
+    // layer (parse + persist + connect attempt). Prefer the size the host declared
+    // in the dir entry; fall back to trimming at the first NUL.
+    if (s_wifi_dirty) {
+        s_wifi_dirty = false;
+        uint32_t len = s_wifi_declared_size;
+        if (len == 0 || len > sizeof(s_wifi_wbuf)) {
+            len = 0;
+            while (len < sizeof(s_wifi_wbuf) && s_wifi_wbuf[len]) {
+                len++;
+            }
+        }
+        wireless_on_creds_written((const char *) s_wifi_wbuf, len);
+        s_wifi_declared_size = 0;
     }
     ESP_LOGD(TAG, "tud_msc_write10_complete_cb() invoked, lun=%" PRIu8, lun);
 }
