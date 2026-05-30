@@ -50,10 +50,9 @@ CONFIG_STATUS_LED_BRIGHTNESS=20
 CONFIG_DEBUG_PROBE_IFACE_JTAG=y
 CONFIG_DEBUG_PROBE_IFACE_NAME="JTAG"
 
-# --- custom partition table: adds a 512KB LittleFS 'storage' partition for
-#     wifi.txt (3MB factory app leaves the free-flash headroom) ---
-CONFIG_PARTITION_TABLE_CUSTOM=y
-CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+# --- custom partition table (partitions.csv): adds a 512KB LittleFS 'storage'
+#     partition for wifi.txt. Selected via board_build.partitions in
+#     platformio.ini (PlatformIO ignores CONFIG_PARTITION_TABLE_CUSTOM here). ---
 
 # --- wireless serial bridge (RFC2217 over WiFi STA), armed by BOOT double-click ---
 CONFIG_WIRELESS_SERIAL=y
