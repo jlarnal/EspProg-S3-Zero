@@ -1,4 +1,4 @@
-set(dependencies "tinyusb" "esp_timer" "usb" "util" "serial_handler" "debug_probe" "esp_ringbuf" "status_led")
+set(dependencies "tinyusb" "esp_timer" "usb" "util" "serial_handler" "debug_probe" "esp_ringbuf" "status_led" "wireless")
 
 # Starting from esp-idf v5.3, the GPIO driver is moved to a separate component
 if("${IDF_VERSION_MAJOR}.${IDF_VERSION_MINOR}" VERSION_GREATER_EQUAL "5.3")

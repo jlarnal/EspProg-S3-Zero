@@ -1,0 +1,30 @@
+menu "Wireless serial (RFC2217)"
+
+    config WIRELESS_SERIAL
+        bool "Enable wireless serial bridge (RFC2217 over WiFi STA)"
+        default n
+        help
+            Expose the target UART over WiFi as an RFC2217 server, armed by a
+            double-click on the onboard BOOT button. Off by default.
+
+    config WIRELESS_RFC2217_PORT
+        int "RFC2217 TCP port"
+        default 3333
+        depends on WIRELESS_SERIAL
+
+    config WIRELESS_MDNS_HOSTNAME
+        string "mDNS hostname (without .local)"
+        default "espprog"
+        depends on WIRELESS_SERIAL
+
+    config WIRELESS_ARM_GPIO
+        int "Arm button GPIO (onboard BOOT)"
+        default 0
+        depends on WIRELESS_SERIAL
+
+    config WIRELESS_SELFTEST
+        bool "Run wifi.txt parser self-test at boot (logs PASS/FAIL)"
+        default n
+        depends on WIRELESS_SERIAL
+
+endmenu
