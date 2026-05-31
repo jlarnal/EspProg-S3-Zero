@@ -11,6 +11,7 @@
 #include "lwip/sockets.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_timer.h"
 #include "esp_log.h"
 
 static const char *TAG = "rfc2217";
@@ -24,10 +25,13 @@ static int s_listen = -1, s_client = -1;
 #define WILL 251
 #define SB   250
 #define SE   240
+#define OPT_BINARY     0
+#define OPT_SGA        3
 #define COM_PORT_OPT  44
+/* client->server COM-PORT commands (server confirms with cmd + 100) */
 #define SET_BAUDRATE   1
 #define SET_CONTROL    5
-/* SET_CONTROL values we care about */
+/* SET_CONTROL values we act on */
 #define DTR_ON   8
 #define DTR_OFF  9
 #define RTS_ON  11
@@ -36,13 +40,61 @@ static int s_listen = -1, s_client = -1;
 /* Per-connection state. */
 typedef struct {
     bool    dtr, rts;
-    uint8_t sb[16];
+    uint8_t cmd;        /* pending DO/WILL/DONT/WONT while reading its option byte */
+    uint8_t sb[32];
     int     sbn;
-    int     state;   /* 0 data, 1 iac, 2 opt-byte, 3 sb, 4 sb-iac */
+    int     state;      /* 0 data, 1 iac, 2 opt-byte, 3 sb, 4 sb-iac */
 } tn_t;
 
-/* Mirror serial_bridge.c tud_cdc_line_state_cb mapping (minus the 10ms postpone
- * timer; over TCP the spurious DTR&RTS frame esptool emits on USB doesn't occur). */
+static void sock_send(const uint8_t *b, int n)
+{
+    const int c = s_client;
+    if (c >= 0 && n > 0) {
+        send(c, b, n, 0);
+    }
+}
+
+static void tn_opt_reply(uint8_t cmd, uint8_t opt)
+{
+    const uint8_t r[3] = { IAC, cmd, opt };
+    sock_send(r, 3);
+}
+
+/* Echo a COM-PORT server confirmation (client command + 100) with the value bytes
+ * the client sent. pyserial waits for these before it proceeds. */
+static void tn_comport_reply(uint8_t client_cmd, const uint8_t *val, int vlen)
+{
+    uint8_t r[64];
+    int o = 0;
+    r[o++] = IAC;
+    r[o++] = SB;
+    r[o++] = COM_PORT_OPT;
+    r[o++] = (uint8_t)(client_cmd + 100);
+    for (int i = 0; i < vlen && o < (int)sizeof(r) - 3; i++) {
+        r[o++] = val[i];
+        if (val[i] == IAC) {
+            r[o++] = IAC;   /* escape 0xFF inside the subnegotiation */
+        }
+    }
+    r[o++] = IAC;
+    r[o++] = SE;
+    sock_send(r, o);
+}
+
+/* Postpone timer for the BOOT=1/RST=1 state (see apply_control). */
+static esp_timer_handle_t s_br_timer;
+
+static void br_timer_cb(void *arg)
+{
+    (void) arg;
+    serial_handler_set_boot_reset_pins(true, true);   // BOOT=1, RST=1 (not in reset)
+}
+
+/* Mirror serial_bridge.c tud_cdc_line_state_cb mapping, INCLUDING its 10ms
+ * postpone of the BOOT=1/RST=1 state. esptool sends DTR and RTS as separate
+ * RFC2217 SET_CONTROL commands, so a (DTR=1,RTS=1) transient occurs between them
+ * just like on USB; applying it immediately would release reset with BOOT high
+ * and miss download mode. Postponing lets the following transition cancel it. */
 static void apply_control(tn_t *t)
 {
     bool rst = true, boot = true;
@@ -53,10 +105,19 @@ static void apply_control(tn_t *t)
         rst = true;
         boot = false;
     }
-    ESP_LOGI(TAG, "DTR=%d RTS=%d -> BOOT=%d RST=%d", t->dtr, t->rts, boot, rst);
-    serial_handler_set_boot_reset_pins(boot, rst);
-    if (!rst) {
-        serial_handler_set_baudrate(115200);
+    if (s_br_timer) {
+        esp_timer_stop(s_br_timer);   // may not be running; ignore the result
+    }
+    if (t->dtr && t->rts) {
+        if (s_br_timer) {
+            esp_timer_start_once(s_br_timer, 10 * 1000 /* us */);
+        }
+    } else {
+        ESP_LOGI(TAG, "DTR=%d RTS=%d -> BOOT=%d RST=%d", t->dtr, t->rts, boot, rst);
+        serial_handler_set_boot_reset_pins(boot, rst);
+        if (!rst) {
+            serial_handler_set_baudrate(115200);
+        }
     }
 }
 
@@ -67,7 +128,9 @@ static void net_rx(const uint8_t *data, size_t len)
     if (c < 0) {
         return;
     }
-    uint8_t tmp[1024];
+    /* static: net_rx runs on the (single) serial_handler UART task; a 1KB stack
+     * buffer there risks overflow. */
+    static uint8_t tmp[1024];
     size_t o = 0;
     for (size_t i = 0; i < len; i++) {
         if (o + 2 >= sizeof(tmp)) {
@@ -84,11 +147,39 @@ static void net_rx(const uint8_t *data, size_t len)
     }
 }
 
-/* socket -> target: strip telnet IAC sequences, forward payload to the UART,
- * act on COM-PORT SET_CONTROL / SET_BAUDRATE. */
+static void handle_subneg(tn_t *t)
+{
+    if (t->sbn < 2 || t->sb[0] != COM_PORT_OPT) {
+        return;
+    }
+    const uint8_t cc = t->sb[1];
+    if (cc == SET_CONTROL && t->sbn >= 3) {
+        switch (t->sb[2]) {
+        case DTR_ON:  t->dtr = true;  apply_control(t); break;
+        case DTR_OFF: t->dtr = false; apply_control(t); break;
+        case RTS_ON:  t->rts = true;  apply_control(t); break;
+        case RTS_OFF: t->rts = false; apply_control(t); break;
+        default: break;
+        }
+    } else if (cc == SET_BAUDRATE && t->sbn >= 6) {
+        const uint32_t baud = ((uint32_t)t->sb[2] << 24) | ((uint32_t)t->sb[3] << 16) |
+                              ((uint32_t)t->sb[4] << 8) | (uint32_t)t->sb[5];
+        if (baud) {
+            serial_handler_set_baudrate(baud);
+        }
+    }
+    /* Confirm any client COM-PORT "set" command (1..12) by echoing it back with
+     * the same value; pyserial blocks waiting for this. */
+    if (cc >= 1 && cc <= 12) {
+        tn_comport_reply(cc, &t->sb[2], t->sbn - 2);
+    }
+}
+
+/* socket -> target: handle telnet negotiation, forward payload to the UART. */
 static void feed(tn_t *t, const uint8_t *buf, int n)
 {
-    uint8_t out[1024];
+    /* static: called only from the (single) rfc2217 server task. */
+    static uint8_t out[1024];
     int o = 0;
     for (int i = 0; i < n; i++) {
         const uint8_t b = buf[i];
@@ -102,20 +193,33 @@ static void feed(tn_t *t, const uint8_t *buf, int n)
             break;
         case 1:
             if (b == IAC) {
-                out[o++] = IAC;          /* escaped 0xFF */
+                out[o++] = IAC;          /* escaped 0xFF -> data */
                 t->state = 0;
             } else if (b == SB) {
                 t->sbn = 0;
                 t->state = 3;
             } else if (b == DO || b == DONT || b == WILL || b == WONT) {
+                t->cmd = b;
                 t->state = 2;
             } else {
-                t->state = 0;            /* other 2-byte command */
+                t->state = 0;            /* other 2-byte command, ignore */
             }
             break;
-        case 2:
-            t->state = 0;                /* swallow option byte */
+        case 2: {
+            const uint8_t opt = b;
+            const bool supported = (opt == OPT_BINARY || opt == OPT_SGA || opt == COM_PORT_OPT);
+            if (t->cmd == WILL) {
+                tn_opt_reply(supported ? DO : DONT, opt);
+            } else if (t->cmd == DO) {
+                tn_opt_reply(supported ? WILL : WONT, opt);
+            } else if (t->cmd == WONT) {
+                tn_opt_reply(DONT, opt);
+            } else { /* DONT */
+                tn_opt_reply(WONT, opt);
+            }
+            t->state = 0;
             break;
+        }
         case 3:
             if (b == IAC) {
                 t->state = 4;
@@ -125,25 +229,9 @@ static void feed(tn_t *t, const uint8_t *buf, int n)
             break;
         case 4:
             if (b == SE) {
-                if (t->sbn >= 2 && t->sb[0] == COM_PORT_OPT) {
-                    if (t->sb[1] == SET_CONTROL && t->sbn >= 3) {
-                        switch (t->sb[2]) {
-                        case DTR_ON:  t->dtr = true;  apply_control(t); break;
-                        case DTR_OFF: t->dtr = false; apply_control(t); break;
-                        case RTS_ON:  t->rts = true;  apply_control(t); break;
-                        case RTS_OFF: t->rts = false; apply_control(t); break;
-                        default: break;
-                        }
-                    } else if (t->sb[1] == SET_BAUDRATE && t->sbn >= 6) {
-                        const uint32_t baud = ((uint32_t)t->sb[2] << 24) | ((uint32_t)t->sb[3] << 16) |
-                                              ((uint32_t)t->sb[4] << 8) | (uint32_t)t->sb[5];
-                        if (baud) {
-                            serial_handler_set_baudrate(baud);
-                        }
-                    }
-                }
+                handle_subneg(t);
                 t->state = 0;
-            } else {
+            } else {                     /* IAC IAC inside SB -> literal 0xFF */
                 if (t->sbn < (int)sizeof(t->sb)) {
                     t->sb[t->sbn++] = b;
                 }
@@ -196,7 +284,15 @@ static void server_task(void *arg)
         s_client = c;
         serial_handler_register_net_data_callback(net_rx);
         ESP_LOGI(TAG, "client connected");
-        uint8_t buf[1024];
+        /* Proactively offer the options pyserial wants, so negotiation completes
+         * even if the client waits for the server to lead. */
+        const uint8_t hello[] = {
+            IAC, WILL, COM_PORT_OPT, IAC, DO, COM_PORT_OPT,
+            IAC, WILL, OPT_BINARY,   IAC, DO, OPT_BINARY,
+            IAC, WILL, OPT_SGA,      IAC, DO, OPT_SGA,
+        };
+        send(c, hello, sizeof(hello), 0);
+        static uint8_t buf[1024];   /* single server task; keep off the stack */
         while (1) {
             const int n = recv(c, buf, sizeof(buf), 0);
             if (n <= 0) {
@@ -219,7 +315,9 @@ void rfc2217_start(uint16_t port)
         return;
     }
     started = true;
-    xTaskCreate(server_task, "rfc2217", 4096, (void *)(uintptr_t)port, 5, NULL);
+    const esp_timer_create_args_t ta = { .callback = br_timer_cb, .name = "rfc2217_br" };
+    esp_timer_create(&ta, &s_br_timer);
+    xTaskCreate(server_task, "rfc2217", 8192, (void *)(uintptr_t)port, 5, NULL);
 }
 
 void rfc2217_stop(void)
