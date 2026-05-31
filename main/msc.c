@@ -144,9 +144,10 @@ static msc_boot_sector_t msc_disk_boot_sector = {
 static const uint8_t msc_disk_fat_table_sector0[] = {
     0xF8, 0xFF,
     0xFF, 0xFF,
-    0xFF, 0xFF, // Cluster no. 2 - Readme file start and end
-    0xFF, 0xFF, // Cluster no. 3 - Pinout file start and end
-    0xFF, 0xFF, // Cluster no. 4 - WIFI.TXT start and end
+    0xFF, 0xFF, // Cluster 2 - README (EOC)
+    0x04, 0x00, // Cluster 3 - PINOUT.MD start -> chains to cluster 4 (PINOUT spans 2 clusters)
+    0xFF, 0xFF, // Cluster 4 - PINOUT.MD end (EOC)
+    0xFF, 0xFF, // Cluster 5 - WIFI.TXT (EOC)
 };
 
 static const uint8_t msc_disk_readme_sector0[] =
@@ -158,12 +159,13 @@ _Static_assert(MSC_README_SIZE < FAT_SECTOR_SIZE, "Only the first sector of the 
 
 // PINOUT.MD served by the MSC drive is the repo's pinout.md, turned into this byte
 // array at build time by main/CMakeLists.txt (-> pinout_md.gen.c). Single source of
-// truth: the drive file and the repo file can never diverge. Served from cluster 3;
-// it may span that cluster's sectors and is clamped to one cluster (4096 bytes).
+// truth: the drive file and the repo file can never diverge. Served from clusters
+// 3-4 (chained in the FAT), so it may span both clusters' sectors; clamped to two
+// clusters (8192 bytes).
 extern const unsigned char pinout_md[];
 extern const unsigned int pinout_md_len;
 #define msc_disk_pinout     pinout_md
-#define MSC_PINOUT_MAX      (FAT_SECTORS_PER_CLUSTER * FAT_SECTOR_SIZE)
+#define MSC_PINOUT_MAX      (2 * FAT_SECTORS_PER_CLUSTER * FAT_SECTOR_SIZE)
 #define MSC_PINOUT_SIZE     ((uint32_t)pinout_md_len)
 
 static uint8_t msc_disk_root_directory_sector0[] = {
@@ -188,7 +190,7 @@ static uint8_t msc_disk_root_directory_sector0[] = {
     'W', 'I', 'F', 'I', ' ', ' ', ' ', ' ', 'T', 'X', 'T',
     0x20, // archive attribute (read-write)
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // time and date for creation & modification
-    0x04, 0, // starting cluster in the FAT table
+    0x05, 0, // starting cluster in the FAT table (cluster 5; PINOUT occupies 3-4)
     0, 0, 0, 0, // size: refreshed at runtime from the wireless cache (read10 ROOT branch)
 };
 
@@ -251,7 +253,7 @@ bool tud_msc_start_stop_cb(const uint8_t lun, const uint8_t power_condition, con
 #define FIRST_ROOT_SECTOR     (FIRST_FAT_SECTOR + FAT_TABLE_SECTORS)
 #define FIRST_README_SECTOR   (FIRST_ROOT_SECTOR + FAT_ROOT_SECTORS)
 #define FIRST_PINOUT_SECTOR   (FIRST_README_SECTOR + FAT_SECTORS_PER_CLUSTER)
-#define FIRST_WIFI_SECTOR     (FIRST_PINOUT_SECTOR + FAT_SECTORS_PER_CLUSTER)
+#define FIRST_WIFI_SECTOR     (FIRST_PINOUT_SECTOR + 2 * FAT_SECTORS_PER_CLUSTER) // PINOUT spans 2 clusters
 #define FIRST_ELSE_SECTOR     (FIRST_WIFI_SECTOR + FAT_SECTORS_PER_CLUSTER)
 #define IS_LBA_BOOT(lba)      ((lba) < FIRST_FAT_SECTOR)
 #define IS_LBA_FAT(lba)       ((lba) >= FIRST_FAT_SECTOR && (lba) < FIRST_ROOT_SECTOR)
