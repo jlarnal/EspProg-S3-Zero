@@ -11,6 +11,8 @@
 #include "wifi_sta.h"
 #include "arm_button.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 static const char *TAG = "wireless";
 static bool s_armed = false;
@@ -77,6 +79,16 @@ bool wireless_is_armed(void)
     return s_armed;
 }
 
+// WiFi bring-up (esp_wifi_init / esp_netif / esp_event / mdns_init) is very
+// stack-hungry, so run it on a dedicated task with a real stack rather than the
+// small arm-button task that triggers it (a 2.5KB stack overflows -> panic).
+static void wifi_start_task(void *arg)
+{
+    (void) arg;
+    wifi_sta_start();
+    vTaskDelete(NULL);
+}
+
 void wireless_arm(void)
 {
     if (s_armed) {
@@ -84,7 +96,7 @@ void wireless_arm(void)
     }
     s_armed = true;
     ESP_LOGI(TAG, "arming WiFi + RFC2217");
-    wifi_sta_start();
+    xTaskCreate(wifi_start_task, "wifi_arm", 8192, NULL, 5, NULL);
 }
 
 void wireless_wifi_txt(const char **buf, uint32_t *len)
