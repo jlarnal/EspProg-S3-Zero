@@ -7,6 +7,7 @@
 #include "sdkconfig.h"
 #if CONFIG_WIRELESS_SERIAL
 #include <string.h>
+#include <stdio.h>
 #include "wifi_creds.h"
 #include "wireless.h"
 #include "rfc2217.h"
@@ -14,6 +15,7 @@
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_netif.h"
+#include "esp_mac.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "mdns.h"
@@ -39,7 +41,10 @@ static void try_candidate(size_t i)
 
 static void publish_results(void)
 {
-    char out[WIFI_TXT_MAXLEN];
+    /* static, NOT on the stack: this runs on the small system-event task and a
+     * 4KB stack buffer would overflow it. Only ever called from the event handler
+     * (serialized), so a single static buffer is safe. */
+    static char out[WIFI_TXT_MAXLEN];
     size_t len = wifi_creds_rewrite(out, sizeof(out), s_creds, s_results, s_n);
     wireless_update_wifi_txt(out, len);   /* persist + refresh MSC mirror cache */
 }
@@ -115,7 +120,16 @@ void wifi_sta_start(void)
     if (r != ESP_OK && r != ESP_ERR_INVALID_STATE) {   /* tolerate an existing default loop */
         ESP_ERROR_CHECK(r);
     }
-    esp_netif_create_default_wifi_sta();
+    esp_netif_t *netif = esp_netif_create_default_wifi_sta();
+    {
+        /* Friendly DHCP/network hostname "Esp-Prog-<MAC LSW>" instead of the
+         * default "espressif" (shows up in the router's client list). */
+        uint8_t mac[6] = {0};
+        esp_read_mac(mac, ESP_MAC_WIFI_STA);
+        char host[24];
+        snprintf(host, sizeof(host), "Esp-Prog-%02X%02X", mac[4], mac[5]);
+        esp_netif_set_hostname(netif, host);
+    }
 
     wifi_init_config_t ic = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&ic));
