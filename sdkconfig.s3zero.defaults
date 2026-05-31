@@ -56,3 +56,7 @@ CONFIG_DEBUG_PROBE_IFACE_NAME="JTAG"
 
 # --- wireless serial bridge (RFC2217 over WiFi STA), armed by BOOT double-click ---
 CONFIG_WIRELESS_SERIAL=y
+
+# --- the WiFi/IP event handler (system event task) rewrites wifi.txt and writes
+#     LittleFS; the default 2304B event-task stack overflows. Give it headroom. ---
+CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=6144
