@@ -22,8 +22,11 @@ extern "C" {
 #define CFG_TUD_DWC2_DMA_ENABLE     1       // Enable DMA
 
 #define CFG_TUD_CDC                 1
-#define CFG_TUD_CDC_RX_BUFSIZE      64
-#define CFG_TUD_CDC_TX_BUFSIZE      64
+/* Larger than one FS bulk packet (64B) so the CDC FIFOs buffer several packets:
+ * the bridge serializes one UART <-> CDC pump, so deep FIFOs cut flush/pace churn
+ * and give slack against priority-5 task contention on the S3-Zero. */
+#define CFG_TUD_CDC_RX_BUFSIZE      512
+#define CFG_TUD_CDC_TX_BUFSIZE      512
 
 #define CFG_TUD_MSC                 1
 #define CFG_TUD_MSC_BUFSIZE         512
