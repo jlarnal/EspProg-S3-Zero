@@ -69,24 +69,38 @@ static volatile int64_t s_usb_active_until_us = 0;
 #define USB_ACTIVE_WINDOW_US (1500 * 1000)   // USB keeps priority 1.5s after each CDC RX
 static transport_data_received_cb_t s_net_cb = NULL;
 
+// USB ownership auto-expires when its activity window lapses: a finished
+// USB-CDC session must not permanently lock out the network (the old code set
+// s_owner=USB on the first CDC byte and never cleared it, so RFC2217 could only
+// be acquired after a reboot). Applied lazily wherever ownership is read.
+// Network ownership is explicit and released by the RFC2217 task on disconnect.
+static serial_owner_t current_owner(void)
+{
+    if (s_owner == SERIAL_OWNER_USB && esp_timer_get_time() >= s_usb_active_until_us) {
+        s_owner = SERIAL_OWNER_NONE;
+    }
+    return s_owner;
+}
+
 void serial_handler_mark_usb_activity(void)
 {
     s_usb_active_until_us = esp_timer_get_time() + USB_ACTIVE_WINDOW_US;
-    if (s_owner == SERIAL_OWNER_NONE) {
+    if (current_owner() == SERIAL_OWNER_NONE) {
         s_owner = SERIAL_OWNER_USB;
     }
 }
 
 serial_owner_t serial_handler_owner(void)
 {
-    return s_owner;
+    return current_owner();
 }
 
 bool serial_handler_acquire(serial_owner_t who)
 {
     if (who == SERIAL_OWNER_NET) {
-        const bool usb_busy = esp_timer_get_time() < s_usb_active_until_us;
-        if (serial_handler_is_flashing() || usb_busy || s_owner == SERIAL_OWNER_USB) {
+        // current_owner() lapses a stale USB claim to NONE; refuse only while USB
+        // is genuinely active (within its window) or another NET session holds it.
+        if (serial_handler_is_flashing() || current_owner() != SERIAL_OWNER_NONE) {
             return false;
         }
         s_owner = SERIAL_OWNER_NET;

@@ -7,6 +7,8 @@
 #include "sdkconfig.h"
 #if CONFIG_WIRELESS_SERIAL
 #include <stdint.h>
+#include <errno.h>
+#include <sys/time.h>
 #include "serial_handler.h"
 #include "lwip/sockets.h"
 #include "freertos/FreeRTOS.h"
@@ -14,8 +16,24 @@
 #include "esp_timer.h"
 #include "esp_log.h"
 
+#define CLIENT_SOCK_TIMEOUT_S 2   /* recv/send timeout so a stalled client can't wedge the task */
+
 static const char *TAG = "rfc2217";
 static int s_listen = -1, s_client = -1;
+/* Set by the send path when the client stops draining (timeout/hard error); the
+ * recv loop checks it after a recv timeout and tears the connection down so the
+ * single-client server returns to accept() instead of wedging forever. */
+static volatile bool s_client_err = false;
+
+/* Telnet negotiation needs a quiet line. A target that streams data (a chatty
+ * app, or boot-ROM garbage at 74880 baud read as 115200) buries the server's
+ * option replies behind bulk data in the TCP send queue, so the client's open()
+ * negotiation times out. Suppress target->client forwarding until the client
+ * gets past negotiation: its first COM-PORT command (esptool, immediately after
+ * telnet options) or a 1s fallback (plain telnet monitors that never send one). */
+#define NEGOTIATION_QUIET_US (1000 * 1000)
+static volatile bool s_negotiated = false;
+static int64_t s_connect_us = 0;
 
 /* Telnet / RFC2217 (COM-PORT-CONTROL option 44) constants */
 #define IAC  255
@@ -121,20 +139,47 @@ static void apply_control(tn_t *t)
     }
 }
 
+/* Send fully to the client, honoring SO_SNDTIMEO. On timeout or hard error,
+ * flag the connection (don't block the caller) so server_task can recover. */
+static void net_send(const uint8_t *b, int n)
+{
+    const int c = s_client;
+    if (c < 0 || n <= 0) {
+        return;
+    }
+    int off = 0;
+    while (off < n) {
+        const int r = send(c, b + off, n - off, 0);
+        if (r > 0) {
+            off += r;
+            continue;
+        }
+        s_client_err = true;   /* EAGAIN (client not draining) or hard error */
+        return;
+    }
+}
+
 /* target -> socket (called by serial_handler when NET owns the UART) */
 static void net_rx(const uint8_t *data, size_t len)
 {
-    const int c = s_client;
-    if (c < 0) {
+    if (s_client < 0) {
         return;
+    }
+    /* Hold off forwarding until the client is past telnet negotiation, so target
+     * chatter can't bury the option replies and time out the client's open(). */
+    if (!s_negotiated) {
+        if (esp_timer_get_time() - s_connect_us < NEGOTIATION_QUIET_US) {
+            return;
+        }
+        s_negotiated = true;
     }
     /* static: net_rx runs on the (single) serial_handler UART task; a 1KB stack
      * buffer there risks overflow. */
     static uint8_t tmp[1024];
     size_t o = 0;
-    for (size_t i = 0; i < len; i++) {
+    for (size_t i = 0; i < len && !s_client_err; i++) {
         if (o + 2 >= sizeof(tmp)) {
-            send(c, tmp, o, 0);
+            net_send(tmp, o);
             o = 0;
         }
         tmp[o++] = data[i];
@@ -142,8 +187,8 @@ static void net_rx(const uint8_t *data, size_t len)
             tmp[o++] = IAC;   /* escape 0xFF */
         }
     }
-    if (o) {
-        send(c, tmp, o, 0);
+    if (o && !s_client_err) {
+        net_send(tmp, o);
     }
 }
 
@@ -171,6 +216,7 @@ static void handle_subneg(tn_t *t)
     /* Confirm any client COM-PORT "set" command (1..12) by echoing it back with
      * the same value; pyserial blocks waiting for this. */
     if (cc >= 1 && cc <= 12) {
+        s_negotiated = true;   /* client is past telnet negotiation -> resume forwarding */
         tn_comport_reply(cc, &t->sb[2], t->sbn - 2);
     }
 }
@@ -280,7 +326,27 @@ static void server_task(void *arg)
             close(c);
             continue;
         }
+        /* Bounded recv/send + keepalive: a client that dies mid-session (or a
+         * pyserial open() that times out without a clean FIN) must not leave this
+         * single-client task blocked forever in recv()/send(), which previously
+         * wedged the whole server (it never returned to accept()). */
+        const struct timeval tv = { .tv_sec = CLIENT_SOCK_TIMEOUT_S, .tv_usec = 0 };
+        setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        const int keepalive = 1;
+        setsockopt(c, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
+        /* Detect a half-open/dead peer in ~7s (idle 4s, then 3 probes 1s apart),
+         * so a client that vanishes without a FIN -- and without us sending data
+         * to trip s_client_err -- still unblocks recv() and frees the server. */
+        const int ka_idle = 4, ka_intvl = 1, ka_cnt = 3;
+        setsockopt(c, IPPROTO_TCP, TCP_KEEPIDLE, &ka_idle, sizeof(ka_idle));
+        setsockopt(c, IPPROTO_TCP, TCP_KEEPINTVL, &ka_intvl, sizeof(ka_intvl));
+        setsockopt(c, IPPROTO_TCP, TCP_KEEPCNT, &ka_cnt, sizeof(ka_cnt));
+
         tn_t t = {0};
+        s_client_err = false;
+        s_negotiated = false;
+        s_connect_us = esp_timer_get_time();
         s_client = c;
         serial_handler_register_net_data_callback(net_rx);
         ESP_LOGI(TAG, "client connected");
@@ -295,16 +361,25 @@ static void server_task(void *arg)
         static uint8_t buf[1024];   /* single server task; keep off the stack */
         while (1) {
             const int n = recv(c, buf, sizeof(buf), 0);
-            if (n <= 0) {
-                break;
+            if (n > 0) {
+                feed(&t, buf, n);
+                continue;
             }
-            feed(&t, buf, n);
+            if (n == 0) {
+                break;                 /* peer closed cleanly */
+            }
+            /* n < 0: a recv timeout (EAGAIN/EWOULDBLOCK) is normal during idle —
+             * keep the session unless the send path flagged the client dead. */
+            if ((errno == EAGAIN || errno == EWOULDBLOCK) && !s_client_err) {
+                continue;
+            }
+            break;                     /* dead client or hard recv error */
         }
         serial_handler_register_net_data_callback(NULL);
         s_client = -1;
         serial_handler_release(SERIAL_OWNER_NET);
         close(c);
-        ESP_LOGI(TAG, "client disconnected");
+        ESP_LOGI(TAG, "client %s", s_client_err ? "dropped (stalled)" : "disconnected");
     }
 }
 
